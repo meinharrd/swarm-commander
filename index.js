@@ -526,14 +526,9 @@ async function refreshTagList() {
   }
 }
 
-function showUploadDetail(tag) {
-  const meta = getUploadMeta(tag.uid);
-  
-  // Clear existing detail view
-  if (selectedUploadDetail) {
-    selectedUploadDetail.destroy();
-  }
-  
+let detailRefreshInterval = null;
+
+function renderUploadDetailContent(tag, meta) {
   const percent = tag.split > 0 ? Math.round((tag.synced / tag.split) * 100) : 0;
   const progressBar = createProgressBar(percent, 25);
   
@@ -545,6 +540,36 @@ function showUploadDetail(tag) {
     ? `{gray-fg}L: list files | Escape: close{/gray-fg}` 
     : `{gray-fg}Escape to close{/gray-fg}`;
   
+  return (
+    `{bold}{cyan-fg}Upload Details{/cyan-fg}{/bold}\n` +
+    `${'─'.repeat(40)}\n\n` +
+    `{bold}Type:{/bold}     ${typeLabel}\n\n` +
+    `{bold}Name:{/bold}     ${meta?.name || '(unknown)'}\n\n` +
+    filesInfo +
+    indexInfo +
+    `{bold}Hash:{/bold}     ${meta?.reference || '(pending)'}\n\n` +
+    `{bold}Date:{/bold}     ${meta?.date || '(unknown)'}\n\n` +
+    `{bold}Batch:{/bold}    ${meta?.batchId?.slice(0, 32) || '(unknown)'}...\n\n` +
+    `{bold}Tag UID:{/bold}  ${tag.uid}\n\n` +
+    `{bold}Progress:{/bold} {cyan-fg}${progressBar}{/cyan-fg} ${percent}%\n` +
+    `           ${tag.synced} / ${tag.split} chunks synced\n\n` +
+    `${'─'.repeat(40)}\n` +
+    listHint
+  );
+}
+
+function showUploadDetail(tag) {
+  const meta = getUploadMeta(tag.uid);
+  
+  // Clear existing detail view and interval
+  if (selectedUploadDetail) {
+    selectedUploadDetail.destroy();
+  }
+  if (detailRefreshInterval) {
+    clearInterval(detailRefreshInterval);
+    detailRefreshInterval = null;
+  }
+  
   const detailBox = blessed.box({
     parent: rightBox,
     top: 0,
@@ -553,30 +578,33 @@ function showUploadDetail(tag) {
     height: '100%-2',
     tags: true,
     style: { fg: 'white', bg: 'black' },
-    content: 
-      `{bold}{cyan-fg}Upload Details{/cyan-fg}{/bold}\n` +
-      `${'─'.repeat(40)}\n\n` +
-      `{bold}Type:{/bold}     ${typeLabel}\n\n` +
-      `{bold}Name:{/bold}     ${meta?.name || '(unknown)'}\n\n` +
-      filesInfo +
-      indexInfo +
-      `{bold}Hash:{/bold}     ${meta?.reference || '(pending)'}\n\n` +
-      `{bold}Date:{/bold}     ${meta?.date || '(unknown)'}\n\n` +
-      `{bold}Batch:{/bold}    ${meta?.batchId?.slice(0, 32) || '(unknown)'}...\n\n` +
-      `{bold}Tag UID:{/bold}  ${tag.uid}\n\n` +
-      `{bold}Progress:{/bold} {cyan-fg}${progressBar}{/cyan-fg} ${percent}%\n` +
-      `           ${tag.synced} / ${tag.split} chunks synced\n\n` +
-      `${'─'.repeat(40)}\n` +
-      listHint,
+    content: renderUploadDetailContent(tag, meta),
   });
   
   selectedUploadDetail = detailBox;
   selectedUploadDetail.meta = meta;
+  selectedUploadDetail.tagUid = tag.uid;
   screen.render();
+  
+  // Auto-refresh every second
+  detailRefreshInterval = setInterval(async () => {
+    if (!selectedUploadDetail || selectedUploadDetail.isManifestView) return;
+    try {
+      const updatedTag = await getTagStatus(tag.uid);
+      const updatedMeta = getUploadMeta(tag.uid);
+      selectedUploadDetail.setContent(renderUploadDetailContent(updatedTag, updatedMeta));
+      selectedUploadDetail.meta = updatedMeta;
+      screen.render();
+    } catch {}
+  }, 1000);
 }
 
 function showManifestFiles(meta) {
-  // Clear existing detail view
+  // Clear existing detail view and refresh interval
+  if (detailRefreshInterval) {
+    clearInterval(detailRefreshInterval);
+    detailRefreshInterval = null;
+  }
   if (selectedUploadDetail) {
     selectedUploadDetail.destroy();
   }
@@ -660,6 +688,10 @@ function showManifestFiles(meta) {
 }
 
 function closeUploadDetail() {
+  if (detailRefreshInterval) {
+    clearInterval(detailRefreshInterval);
+    detailRefreshInterval = null;
+  }
   if (selectedUploadDetail) {
     selectedUploadDetail.destroy();
     selectedUploadDetail = null;
