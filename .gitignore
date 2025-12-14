@@ -1,4 +1,5 @@
 node_modules/
 state/
+logs/
 test-files/
 .DS_Store

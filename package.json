@@ -1,6 +1,6 @@
 {
   "name": "swarm-commander",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "type": "module",
   "description": "Midnight Commander-style TUI for managing Swarm uploads",
   "main": "index.js",

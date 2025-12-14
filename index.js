@@ -4,11 +4,27 @@ import fs from 'fs';
 import path from 'path';
 import http from 'http';
 import { homedir } from 'os';
+import { execSync } from 'child_process';
 
 // State directory (relative to script location)
 const stateDir = path.join(path.dirname(process.argv[1]) || '.', 'state');
 if (!fs.existsSync(stateDir)) {
   fs.mkdirSync(stateDir, { recursive: true });
+}
+
+// Logs directory
+const logsDir = path.join(path.dirname(process.argv[1]) || '.', 'logs');
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
+const uploadLogPath = path.join(logsDir, 'upload.log');
+
+function logUpload(message) {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${message}\n`;
+  try {
+    fs.appendFileSync(uploadLogPath, line);
+  } catch {}
 }
 
 // Config
@@ -113,6 +129,52 @@ async function createTag() {
   return result.uid;
 }
 
+function collectDirectoryFiles(dirPath, basePath = '') {
+  const files = [];
+  const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+  
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name);
+    const relativePath = basePath ? path.join(basePath, entry.name) : entry.name;
+    
+    if (entry.isDirectory()) {
+      files.push(...collectDirectoryFiles(fullPath, relativePath));
+    } else if (entry.isFile()) {
+      try {
+        const stat = fs.statSync(fullPath);
+        files.push({
+          path: relativePath,
+          fullPath: fullPath,
+          size: stat.size,
+        });
+      } catch {}
+    }
+  }
+  
+  return files;
+}
+
+function getDirectoryStats(dirPath) {
+  const files = collectDirectoryFiles(dirPath);
+  const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+  return { files, totalSize, fileCount: files.length };
+}
+
+function createTarArchive(dirPath) {
+  const tempTar = path.join(stateDir, `upload-${Date.now()}.tar`);
+  
+  try {
+    // Use "." to put contents at root (not wrapped in directory name)
+    // This ensures index.html is at root for swarm-index-document to work
+    execSync(`tar -cf "${tempTar}" -C "${dirPath}" .`, {
+      stdio: 'pipe',
+    });
+    return tempTar;
+  } catch (err) {
+    throw new Error(`Failed to create tar archive: ${err.message}`);
+  }
+}
+
 async function getTagStatus(tagUid) {
   return await httpRequest({
     hostname: '127.0.0.1',
@@ -174,7 +236,7 @@ const header = blessed.box({
   left: 0,
   width: '100%',
   height: 1,
-  content: ' {bold}SWARM COMMANDER{/bold}  │  F2: Batch  │  F5: Upload  │  F10/Q: Quit  │  Tab: Switch  ',
+  content: ' {bold}SWARM COMMANDER{/bold}  │  F2: Batch  │  F5: Upload File/Dir  │  F10/Q: Quit  │  Tab: Switch  ',
   tags: true,
   style: {
     fg: 'black',
@@ -475,6 +537,14 @@ function showUploadDetail(tag) {
   const percent = tag.split > 0 ? Math.round((tag.synced / tag.split) * 100) : 0;
   const progressBar = createProgressBar(percent, 25);
   
+  const isDir = meta?.isDirectory;
+  const typeLabel = isDir ? 'Directory' : 'File';
+  const filesInfo = isDir && meta?.fileCount ? `{bold}Files:{/bold}    ${meta.fileCount} files\n\n` : '';
+  const indexInfo = meta?.indexDocument ? `{bold}Index:{/bold}    {green-fg}${meta.indexDocument}{/green-fg}\n\n` : '';
+  const listHint = (isDir && meta?.files?.length) 
+    ? `{gray-fg}L: list files | Escape: close{/gray-fg}` 
+    : `{gray-fg}Escape to close{/gray-fg}`;
+  
   const detailBox = blessed.box({
     parent: rightBox,
     top: 0,
@@ -486,7 +556,10 @@ function showUploadDetail(tag) {
     content: 
       `{bold}{cyan-fg}Upload Details{/cyan-fg}{/bold}\n` +
       `${'─'.repeat(40)}\n\n` +
+      `{bold}Type:{/bold}     ${typeLabel}\n\n` +
       `{bold}Name:{/bold}     ${meta?.name || '(unknown)'}\n\n` +
+      filesInfo +
+      indexInfo +
       `{bold}Hash:{/bold}     ${meta?.reference || '(pending)'}\n\n` +
       `{bold}Date:{/bold}     ${meta?.date || '(unknown)'}\n\n` +
       `{bold}Batch:{/bold}    ${meta?.batchId?.slice(0, 32) || '(unknown)'}...\n\n` +
@@ -494,10 +567,95 @@ function showUploadDetail(tag) {
       `{bold}Progress:{/bold} {cyan-fg}${progressBar}{/cyan-fg} ${percent}%\n` +
       `           ${tag.synced} / ${tag.split} chunks synced\n\n` +
       `${'─'.repeat(40)}\n` +
-      `{gray-fg}Press Escape to close{/gray-fg}`,
+      listHint,
   });
   
   selectedUploadDetail = detailBox;
+  selectedUploadDetail.meta = meta;
+  screen.render();
+}
+
+function showManifestFiles(meta) {
+  // Clear existing detail view
+  if (selectedUploadDetail) {
+    selectedUploadDetail.destroy();
+  }
+  
+  const files = meta.files || [];
+  const reference = meta.reference;
+  const dirName = meta.name?.replace(/\/$/, '') || 'directory';
+  
+  const fileListBox = blessed.box({
+    parent: rightBox,
+    top: 0,
+    left: 0,
+    width: '100%-2',
+    height: 3,
+    tags: true,
+    style: { fg: 'white', bg: 'black' },
+    content: 
+      `{bold}{cyan-fg}Files in ${dirName}/{/cyan-fg}{/bold}\n` +
+      `${'─'.repeat(40)}\n` +
+      `{gray-fg}${files.length} file(s){/gray-fg}`,
+  });
+  
+  const filesList = blessed.list({
+    parent: rightBox,
+    top: 3,
+    left: 0,
+    width: '100%-2',
+    height: '100%-6',
+    keys: true,
+    vi: true,
+    mouse: true,
+    tags: true,
+    scrollbar: {
+      ch: '|',
+      style: { bg: 'cyan' },
+    },
+    style: {
+      fg: 'white',
+      bg: 'black',
+      selected: { fg: 'black', bg: 'cyan', bold: true },
+    },
+  });
+  
+  const items = files.map(entry => {
+    const filePath = entry.path || entry.name || entry;
+    const size = entry.size ? ` (${formatSizeHuman(entry.size)})` : '';
+    return `  ${filePath}${size}`;
+  });
+  
+  if (items.length === 0) {
+    items.push('  (no files recorded)');
+  }
+  
+  filesList.setItems(items);
+  
+  const footerBox = blessed.box({
+    parent: rightBox,
+    bottom: 0,
+    left: 0,
+    width: '100%-2',
+    height: 1,
+    tags: true,
+    style: { fg: 'gray', bg: 'black' },
+    content: reference 
+      ? `{gray-fg}Escape: back | Hash: ${reference.slice(0, 24)}...{/gray-fg}`
+      : `{gray-fg}Escape: back{/gray-fg}`,
+  });
+  
+  // Create a container to track all elements
+  selectedUploadDetail = {
+    destroy: () => {
+      fileListBox.destroy();
+      filesList.destroy();
+      footerBox.destroy();
+    },
+    isManifestView: true,
+  };
+  
+  filesList.focus();
   screen.render();
 }
 
@@ -509,7 +667,7 @@ function closeUploadDetail() {
   }
 }
 
-function showUploadConfirmation(filePath, fileSize, onConfirm) {
+function showUploadConfirmation(filePath, fileSize, onConfirm, isDirectory = false, fileCount = 0, hasIndex = false) {
   const fileName = path.basename(filePath);
   
   const dialog = blessed.box({
@@ -517,9 +675,9 @@ function showUploadConfirmation(filePath, fileSize, onConfirm) {
     top: 'center',
     left: 'center',
     width: 60,
-    height: 12,
+    height: isDirectory ? (hasIndex ? 16 : 14) : 12,
     border: 'line',
-    label: ' {bold}Upload to Swarm{/bold} ',
+    label: ` {bold}Upload ${isDirectory ? 'Directory' : 'File'} to Swarm{/bold} `,
     tags: true,
     style: {
       fg: 'white',
@@ -528,17 +686,26 @@ function showUploadConfirmation(filePath, fileSize, onConfirm) {
     },
   });
   
+  const indexLine = hasIndex ? `{bold}Index:{/bold}  {green-fg}index.html{/green-fg}\n\n` : '';
+  
+  const contentLines = isDirectory
+    ? `{bold}Directory:{/bold}  ${fileName}\n\n` +
+      `{bold}Files:{/bold}  ${fileCount} files\n\n` +
+      `{bold}Total Size:{/bold}  ${formatSizeHuman(fileSize)}\n\n` +
+      indexLine +
+      `{bold}Name on Swarm:{/bold}  ${fileName}/`
+    : `{bold}File:{/bold}  ${fileName}\n\n` +
+      `{bold}Size:{/bold}  ${formatSizeHuman(fileSize)}\n\n` +
+      `{bold}Name on Swarm:{/bold}  ${fileName}`;
+  
   blessed.box({
     parent: dialog,
     top: 1,
     left: 2,
     width: '100%-4',
-    height: 6,
+    height: isDirectory ? 8 : 6,
     tags: true,
-    content: 
-      `{bold}File:{/bold}  ${fileName}\n\n` +
-      `{bold}Size:{/bold}  ${formatSizeHuman(fileSize)}\n\n` +
-      `{bold}Name on Swarm:{/bold}  ${fileName}`,
+    content: contentLines,
     style: { fg: 'white', bg: 'black' },
   });
   
@@ -600,6 +767,8 @@ async function uploadFile(filePath) {
   
   const fileName = path.basename(filePath);
   const fileSize = fs.statSync(filePath).size;
+  
+  logUpload(`START file="${fileName}" size=${fileSize} path="${filePath}"`);
   
   // Create progress dialog (modal)
   const progressBox = blessed.box({
@@ -840,14 +1009,336 @@ async function uploadFile(filePath) {
     closeProgress();
     
     if (syncComplete) {
+      logUpload(`COMPLETE file="${fileName}" reference=${result.reference} tag=${tagUid} synced=true`);
       showMessage(`Synced: ${fileName} → ${result.reference.slice(0, 40)}...`, 'success');
     } else {
+      logUpload(`COMPLETE file="${fileName}" reference=${result.reference} tag=${tagUid} synced=false`);
       showMessage(`Uploaded (syncing): ${fileName} → ${result.reference.slice(0, 32)}...`, 'success');
     }
     
   } catch (err) {
+    logUpload(`ERROR file="${fileName}" error="${err.message}"`);
     if (backgrounded) {
       if (progressInterval) clearInterval(progressInterval);
+      showMessage(`Upload failed: ${err.message}`, 'error');
+      return;
+    }
+    closeProgress();
+    showMessage(`Upload failed: ${err.message}`, 'error');
+  }
+}
+
+async function uploadDirectory(dirPath) {
+  if (!batchId) {
+    showMessage('Batch ID not set! Press F2 to set it.', 'error');
+    return;
+  }
+  
+  const dirName = path.basename(dirPath);
+  const { totalSize, fileCount } = getDirectoryStats(dirPath);
+  
+  logUpload(`START dir="${dirName}" files=${fileCount} size=${totalSize} path="${dirPath}"`);
+  
+  // Create progress dialog (modal)
+  const progressBox = blessed.box({
+    parent: screen,
+    top: 'center',
+    left: 'center',
+    width: 60,
+    height: 18,
+    border: 'line',
+    label: ' {bold}Uploading Directory{/bold} ',
+    tags: true,
+    keys: true,
+    vi: false,
+    style: {
+      fg: 'white',
+      bg: 'black',
+      border: { fg: 'yellow' },
+    },
+  });
+  
+  const statusLine = blessed.box({
+    parent: progressBox,
+    top: 1,
+    left: 2,
+    width: '100%-4',
+    height: 1,
+    tags: true,
+    content: '{yellow-fg}Creating tar archive...{/yellow-fg}',
+    style: { fg: 'white', bg: 'black' },
+  });
+  
+  const fileInfo = blessed.box({
+    parent: progressBox,
+    top: 3,
+    left: 2,
+    width: '100%-4',
+    height: 1,
+    tags: true,
+    content: `Directory: ${dirName.slice(0, 40)} (${fileCount} files)`,
+    style: { fg: 'gray', bg: 'black' },
+  });
+  
+  const tagInfo = blessed.box({
+    parent: progressBox,
+    top: 4,
+    left: 2,
+    width: '100%-4',
+    height: 1,
+    tags: true,
+    content: 'Tag UID: ...',
+    style: { fg: 'gray', bg: 'black' },
+  });
+  
+  const progressBar = blessed.box({
+    parent: progressBox,
+    top: 6,
+    left: 2,
+    width: '100%-4',
+    height: 1,
+    tags: true,
+    content: '{cyan-fg}' + createProgressBar(0) + '{/cyan-fg}  0%',
+    style: { fg: 'white', bg: 'black' },
+  });
+  
+  const dataInfo = blessed.box({
+    parent: progressBox,
+    top: 7,
+    left: 2,
+    width: '100%-4',
+    height: 1,
+    tags: true,
+    content: `0 B / ${formatSizeHuman(totalSize)}`,
+    style: { fg: 'gray', bg: 'black' },
+  });
+  
+  const phaseInfo = blessed.box({
+    parent: progressBox,
+    top: 9,
+    left: 2,
+    width: '100%-4',
+    height: 1,
+    tags: true,
+    content: 'Phase: Creating archive',
+    style: { fg: 'white', bg: 'black' },
+  });
+  
+  const manifestInfo = blessed.box({
+    parent: progressBox,
+    top: 11,
+    left: 2,
+    width: '100%-4',
+    height: 1,
+    tags: true,
+    content: '{gray-fg}Manifest: Will be created automatically{/gray-fg}',
+    style: { fg: 'gray', bg: 'black' },
+  });
+  
+  const bgButton = blessed.button({
+    parent: progressBox,
+    bottom: 1,
+    left: 'center',
+    width: 22,
+    height: 1,
+    content: ' Move to Background ',
+    tags: true,
+    keys: true,
+    mouse: true,
+    style: {
+      fg: 'white',
+      bg: 'blue',
+      focus: { fg: 'black', bg: 'cyan' },
+    },
+  });
+  
+  // Make modal - grab focus
+  progressBox.focus();
+  screen.render();
+  
+  let tagUid = null;
+  let progressInterval = null;
+  let backgrounded = false;
+  let tarPath = null;
+  
+  const updateProgress = (phase, percent, transferred = 0) => {
+    if (backgrounded) return;
+    const bar = createProgressBar(percent);
+    progressBar.setContent(`{cyan-fg}${bar}{/cyan-fg} ${percent.toFixed(0).padStart(3)}%`);
+    dataInfo.setContent(`${formatSizeHuman(transferred)} / ${formatSizeHuman(totalSize)}`);
+    phaseInfo.setContent(`Phase: ${phase}`);
+    screen.render();
+  };
+  
+  const cleanupTar = () => {
+    if (tarPath && fs.existsSync(tarPath)) {
+      try {
+        fs.unlinkSync(tarPath);
+      } catch {}
+    }
+  };
+  
+  const closeProgress = () => {
+    if (progressInterval) clearInterval(progressInterval);
+    cleanupTar();
+    if (!backgrounded) {
+      progressBox.destroy();
+    }
+    fileList.focus();
+    screen.render();
+  };
+  
+  const moveToBackground = () => {
+    backgrounded = true;
+    progressBox.destroy();
+    fileList.focus();
+    screen.render();
+    showMessage(`Upload running in background (Tag: ${tagUid})`, 'info');
+  };
+  
+  bgButton.on('press', moveToBackground);
+  progressBox.key(['escape', 'b'], moveToBackground);
+  
+  try {
+    // Create tar archive
+    tarPath = createTarArchive(dirPath);
+    const tarSize = fs.statSync(tarPath).size;
+    
+    statusLine.setContent('{yellow-fg}Creating tag...{/yellow-fg}');
+    screen.render();
+    
+    // Create tag
+    tagUid = await createTag();
+    
+    // Collect file list for metadata
+    const filesList = collectDirectoryFiles(dirPath);
+    
+    // Check if directory contains index.html
+    const hasIndexHtml = filesList.some(f => f.path === 'index.html' || f.path.endsWith('/index.html'));
+    
+    // Save initial metadata with file list
+    saveUploadMeta(tagUid, {
+      name: dirName + '/',
+      date: new Date().toISOString(),
+      batchId: batchId,
+      reference: null,
+      isDirectory: true,
+      fileCount: fileCount,
+      files: filesList.map(f => ({ path: f.path, size: f.size })),
+      indexDocument: hasIndexHtml ? 'index.html' : null,
+    });
+    
+    tagInfo.setContent(`Tag UID: {green-fg}${tagUid}{/green-fg}`);
+    statusLine.setContent('{yellow-fg}Uploading directory to Bee node...{/yellow-fg}');
+    progressBox.style.border.fg = 'yellow';
+    screen.render();
+    
+    const tarData = fs.readFileSync(tarPath);
+    
+    // Start progress tracking
+    progressInterval = setInterval(async () => {
+      try {
+        const tag = await getTagStatus(tagUid);
+        if (tag.split > 0) {
+          const total = tag.split;
+          const seen = tag.seen || 0;
+          const sent = tag.sent || 0;
+          const synced = tag.synced || 0;
+          
+          const progress = Math.max(seen, sent, synced);
+          const percent = (progress / total) * 100;
+          const transferred = Math.round((progress / total) * totalSize);
+          
+          if (synced >= total) {
+            updateProgress('Synced with network ✓', 100, totalSize);
+            statusLine.setContent('{green-fg}Upload complete!{/green-fg}');
+            progressBox.style.border.fg = 'green';
+          } else if (sent > 0) {
+            updateProgress(`Syncing (${synced}/${total} chunks)`, percent, transferred);
+            statusLine.setContent('{cyan-fg}Syncing with Swarm network...{/cyan-fg}');
+            progressBox.style.border.fg = 'cyan';
+          } else if (seen > 0) {
+            updateProgress(`Uploading (${seen}/${total} chunks)`, percent, transferred);
+            statusLine.setContent('{yellow-fg}Uploading to Bee node...{/yellow-fg}');
+          } else {
+            updateProgress(`Processing (${tag.split} chunks)`, 5, 0);
+          }
+        }
+      } catch {
+        // Ignore polling errors
+      }
+    }, 300);
+    
+    // Upload tar with collection headers
+    const uploadHeaders = {
+      'Content-Type': 'application/x-tar',
+      'Content-Length': tarData.length,
+      'swarm-postage-batch-id': batchId,
+      'swarm-tag': tagUid.toString(),
+      'swarm-collection': 'true',
+    };
+    
+    if (hasIndexHtml) {
+      uploadHeaders['swarm-index-document'] = 'index.html';
+    }
+    
+    const result = await httpRequest({
+      hostname: '127.0.0.1',
+      port: 1633,
+      path: `/bzz?name=${encodeURIComponent(dirName)}`,
+      method: 'POST',
+      headers: uploadHeaders,
+    }, tarData);
+    
+    // Clean up tar file immediately after upload
+    cleanupTar();
+    tarPath = null;
+    
+    // Save reference to metadata
+    saveUploadMeta(tagUid, { reference: result.reference });
+    manifestInfo.setContent(`{green-fg}Manifest: ${result.reference.slice(0, 32)}...{/green-fg}`);
+
+    if (backgrounded) {
+      if (progressInterval) clearInterval(progressInterval);
+      return;
+    }
+    
+    statusLine.setContent('{cyan-fg}Syncing with Swarm network...{/cyan-fg}');
+    progressBox.style.border.fg = 'cyan';
+    screen.render();
+    
+    // Wait for sync to complete (poll for up to 2 minutes)
+    let syncComplete = false;
+    for (let i = 0; i < 240 && !syncComplete && !backgrounded; i++) {
+      await new Promise(r => setTimeout(r, 500));
+      try {
+        const tag = await getTagStatus(tagUid);
+        if (tag.synced >= tag.split && tag.split > 0) {
+          syncComplete = true;
+        }
+      } catch {}
+    }
+    
+    if (backgrounded) {
+      if (progressInterval) clearInterval(progressInterval);
+      return;
+    }
+    
+    closeProgress();
+    
+    if (syncComplete) {
+      logUpload(`COMPLETE dir="${dirName}" files=${fileCount} reference=${result.reference} tag=${tagUid} index=${hasIndexHtml ? 'index.html' : 'none'} synced=true`);
+      showMessage(`Synced: ${dirName}/ → ${result.reference.slice(0, 40)}...`, 'success');
+    } else {
+      logUpload(`COMPLETE dir="${dirName}" files=${fileCount} reference=${result.reference} tag=${tagUid} index=${hasIndexHtml ? 'index.html' : 'none'} synced=false`);
+      showMessage(`Uploaded (syncing): ${dirName}/ → ${result.reference.slice(0, 32)}...`, 'success');
+    }
+    
+  } catch (err) {
+    logUpload(`ERROR dir="${dirName}" error="${err.message}"`);
+    if (backgrounded) {
+      if (progressInterval) clearInterval(progressInterval);
+      cleanupTar();
       showMessage(`Upload failed: ${err.message}`, 'error');
       return;
     }
@@ -920,8 +1411,18 @@ screen.key(['f5'], () => {
     showUploadConfirmation(selected.path, selected.size, () => {
       uploadFile(selected.path);
     });
-  } else if (selected?.isDir) {
-    showMessage('Cannot upload a directory', 'error');
+  } else if (selected?.isDir && selected.name !== '..') {
+    const { files, totalSize, fileCount } = getDirectoryStats(selected.path);
+    if (fileCount === 0) {
+      showMessage('Directory is empty', 'error');
+      return;
+    }
+    const hasIndex = files.some(f => f.path === 'index.html' || f.path.endsWith('/index.html'));
+    showUploadConfirmation(selected.path, totalSize, () => {
+      uploadDirectory(selected.path);
+    }, true, fileCount, hasIndex);
+  } else if (selected?.name === '..') {
+    showMessage('Cannot upload parent directory', 'error');
   }
 });
 
@@ -970,6 +1471,12 @@ tagList.key(['escape'], () => {
 screen.key(['escape'], () => {
   if (selectedUploadDetail) {
     closeUploadDetail();
+  }
+});
+
+screen.key(['l'], () => {
+  if (selectedUploadDetail && selectedUploadDetail.meta?.isDirectory && selectedUploadDetail.meta?.files?.length && !selectedUploadDetail.isManifestView) {
+    showManifestFiles(selectedUploadDetail.meta);
   }
 });
 
